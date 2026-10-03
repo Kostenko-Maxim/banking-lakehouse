@@ -1,0 +1,4 @@
+-c requirements-runtime.lock
+psycopg[binary]==3.2.3
+trino==0.331.0
+requests==2.32.3

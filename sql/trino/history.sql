@@ -1,0 +1,2 @@
+SELECT customer_version_id,customer_id,region,segment,valid_from,valid_to,is_current,change_version
+FROM iceberg.dds.customer_history

@@ -1,0 +1,15 @@
+# Direct and transitive dependencies used by the Python pipeline (Python 3.11+).
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+psycopg==3.2.3
+psycopg-binary==3.2.3
+python-dateutil==2.9.0.post0
+pytz==2026.4
+requests==2.32.3
+six==1.17.0
+trino==0.331.0
+typing-extensions==4.16.0
+tzdata==2026.4
+tzlocal==5.4.4
+urllib3==2.8.0

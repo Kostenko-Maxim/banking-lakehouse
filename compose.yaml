@@ -1,0 +1,252 @@
+name: ${COMPOSE_PROJECT_NAME:-banking-lakehouse}
+
+x-airflow: &airflow
+  image: banking-airflow:2.10.5
+  build:
+    context: .
+    dockerfile: infra/airflow/Dockerfile
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://bank:${POSTGRES_PASSWORD}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/project/dags
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    PGHOST: postgres
+    PGUSER: bank
+    PGDATABASE: analytics
+    SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-1g}
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+    SPARK_SHUFFLE_PARTITIONS: ${SPARK_SHUFFLE_PARTITIONS:-8}
+    DQ_MAX_REJECT_RATIO: ${DQ_MAX_REJECT_RATIO:-0.10}
+    FRESHNESS_SECONDS: ${FRESHNESS_SECONDS:-86400}
+    ALERT_URL: http://alerts:8090/events
+  volumes:
+    - .:/opt/project:ro
+    - source-data:/data
+    - airflow-logs:/opt/airflow/logs
+    - spark-events:/opt/spark-events
+  networks: [lake]
+
+services:
+  postgres:
+    image: postgres:16.6-bookworm
+    environment:
+      POSTGRES_USER: bank
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: analytics
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/00-databases.sql:ro
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    mem_limit: ${PG_MEM_LIMIT:-512m}
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U bank -d analytics"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [lake, interfaces]
+
+  db-init:
+    image: postgres:16.6-bookworm
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    command: [psql, -h, postgres, -U, bank, -d, analytics, -v, ON_ERROR_STOP=1, -f, /init.sql]
+    volumes: ["./infra/postgres/init.sql:/init.sql:ro"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [lake]
+
+  namenode:
+    image: banking-hadoop:3.3.6
+    build: {context: ., dockerfile: infra/hadoop/Dockerfile}
+    hostname: namenode
+    command: [namenode]
+    volumes:
+      - hdfs-name:/hadoop/name
+      - ./infra/hadoop/conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+    ports: ["127.0.0.1:${HDFS_PORT:-9870}:9870"]
+    mem_limit: ${NN_MEM_LIMIT:-768m}
+    healthcheck:
+      test: [CMD-SHELL, "curl -fsS 'http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=NameNodeStatus' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    networks: [lake, interfaces]
+
+  datanode:
+    image: banking-hadoop:3.3.6
+    hostname: datanode
+    command: [datanode]
+    volumes:
+      - hdfs-data:/hadoop/data
+      - ./infra/hadoop/conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+    depends_on:
+      namenode: {condition: service_healthy}
+    mem_limit: ${DN_MEM_LIMIT:-768m}
+    healthcheck:
+      test: [CMD-SHELL, "hdfs dfsadmin -report | python3 -c 'import sys; assert \"Live datanodes (1)\" in sys.stdin.read()'"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+    networks: [lake]
+
+  hdfs-init:
+    image: banking-hadoop:3.3.6
+    entrypoint: [/bin/bash, -ec]
+    command: ["hdfs dfsadmin -safemode wait && hdfs dfs -mkdir -p /warehouse /sources && hdfs dfs -chmod -R 777 /warehouse /sources"]
+    depends_on:
+      datanode: {condition: service_healthy}
+    networks: [lake]
+
+  metastore:
+    image: banking-hive:3.1.3
+    build: {context: ., dockerfile: infra/hive/Dockerfile}
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      HADOOP_HEAPSIZE: "512"
+    depends_on:
+      db-init: {condition: service_completed_successfully}
+      hdfs-init: {condition: service_completed_successfully}
+    mem_limit: ${HMS_MEM_LIMIT:-1g}
+    healthcheck:
+      test: [CMD, python3, -c, "import socket; socket.create_connection(('localhost',9083),3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+    networks: [lake]
+
+  spark-master:
+    image: banking-spark:3.5.3
+    build: {context: ., dockerfile: infra/spark/Dockerfile}
+    hostname: spark-master
+    environment:
+      SPARK_DAEMON_MEMORY: 256m
+    command: [/opt/spark/bin/spark-class, org.apache.spark.deploy.master.Master, --host, spark-master-internal]
+    ports: ["127.0.0.1:${SPARK_UI_PORT:-8082}:8080"]
+    mem_limit: ${SPARK_MASTER_MEM_LIMIT:-512m}
+    volumes: ["spark-events:/opt/spark-events"]
+    healthcheck:
+      test: [CMD, python3, -c, "import socket; socket.create_connection(('spark-master-internal',7077),3).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      lake:
+        aliases: [spark-master-internal]
+      interfaces: {}
+
+  spark-worker:
+    image: banking-spark:3.5.3
+    hostname: spark-worker
+    command: [/bin/bash, -ec, "exec /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker --cores $${SPARK_WORKER_CORES} --memory $${SPARK_WORKER_MEMORY} spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+    volumes: [".:/opt/project:ro", "spark-events:/opt/spark-events"]
+    mem_limit: ${SPARK_WORKER_MEM_LIMIT:-3g}
+    depends_on:
+      spark-master: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request,json; d=json.load(urllib.request.urlopen('http://spark-master:8080/json/')); assert any(w['state']=='ALIVE' for w in d['workers'])"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [lake]
+
+  trino:
+    image: trinodb/trino:468
+    hostname: trino
+    environment:
+      TRINO_HEAP: ${TRINO_HEAP:-2G}
+    entrypoint: [/bin/bash, /entrypoint.sh]
+    volumes:
+      - ./infra/trino/config.properties:/etc/trino/config.properties:ro
+      - ./infra/trino/node.properties:/etc/trino/node.properties:ro
+      - ./infra/trino/catalog:/etc/trino/catalog:ro
+      - ./infra/hadoop/conf:/etc/trino/hadoop:ro
+      - ./infra/trino/entrypoint.sh:/entrypoint.sh:ro
+      - trino-data:/data/trino
+    ports: ["127.0.0.1:${TRINO_PORT:-8081}:8080"]
+    mem_limit: ${TRINO_MEM_LIMIT:-3g}
+    depends_on:
+      metastore: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, trino, --server, http://localhost:8080, --execute, SELECT 1]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+    networks: [lake, interfaces]
+
+  airflow-init:
+    <<: *airflow
+    command: [bash, -ec, "airflow db migrate && python -m bank.cli init && (airflow users list --output json | python -c 'import sys,json; assert any(u[\"username\"]==\"admin\" for u in json.load(sys.stdin))' || airflow users create --username admin --password \"$${AIRFLOW_ADMIN_PASSWORD}\" --firstname Local --lastname Admin --role Admin --email admin@localhost)"]
+    depends_on:
+      db-init: {condition: service_completed_successfully}
+
+  airflow-scheduler:
+    <<: *airflow
+    hostname: airflow-scheduler
+    command: scheduler
+    mem_limit: ${AIRFLOW_SCHEDULER_MEM_LIMIT:-3g}
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+      spark-worker: {condition: service_healthy}
+      trino: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8974/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    mem_limit: ${AIRFLOW_WEB_MEM_LIMIT:-1g}
+    ports: ["127.0.0.1:${AIRFLOW_PORT:-8080}:8080"]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+    networks: [lake, interfaces]
+
+  alerts:
+    <<: *airflow
+    entrypoint: [python, -m, bank.alerts]
+    command: []
+    mem_limit: 256m
+    ports: ["127.0.0.1:${ALERT_PORT:-8090}:8090"]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [lake, interfaces]
+
+volumes:
+  postgres-data:
+  hdfs-name:
+  hdfs-data:
+  source-data:
+  airflow-logs:
+  spark-events:
+  trino-data:
+
+networks:
+  lake:
+    internal: true
+  interfaces:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"

@@ -1,0 +1,16 @@
+[project]
+name = "banking-lakehouse"
+version = "1.0.0"
+requires-python = ">=3.11"
+description = "Local banking lakehouse: Spark, Iceberg, HDFS, Trino and PostgreSQL"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
